@@ -153,7 +153,8 @@ button:focus-visible,input:focus-visible,select:focus-visible,.hbtn:focus-visibl
 // ── CONFIG — edit these for self-hosted deployments ──
 var RELAY = 'wss://relay.arnon.app/ws';
 var BASE = 'https://arnon.app/pwa/app.html';
-var ws, room, myKeys, derivedKey, peerPub, connected = false, peerClosed = false, disconnectNotice = null;
+var ws, room, myKeys, sendKey, recvKey, peerPub, connected = false, peerClosed = false, disconnectNotice = null;
+var sendSeq = 0, recvSeq = 0, isCreator = false;
 var timerInterval = null;
 var ttlSeconds = 0, roomCreatedAt = 0, destructAt = 0, warned60 = false;
 var blobUrls = [];
@@ -172,12 +173,24 @@ async function genKeys() { myKeys = await crypto.subtle.generateKey({ name: 'ECD
 async function exportPub() { var r = await crypto.subtle.exportKey('raw', myKeys.publicKey); return toB64(new Uint8Array(r)); }
 async function importPub(b64) { return crypto.subtle.importKey('raw', fromB64(b64), { name: 'ECDH', namedCurve: 'P-256' }, true, []); } // extractable so computeSafetyNumber can re-export the peer key
 
-// Derive AES key via HKDF over the ECDH shared secret (domain separation).
+// Derive two one-way AES-GCM keys via HKDF over the ECDH shared secret. The direction
+// is bound into the HKDF `info`, and the creator/joiner roles fix which key each side
+// sends with vs. receives with — so a frame can never be reflected back to its own
+// sender (each side decrypts only with the *other* direction's key). Both peers derive
+// both keys; the role is decided locally and deterministically (creator = "a", joiner
+// = "b") before any message is sent, so the two ends always agree on the assignment.
 async function derive(pub) {
   var shared = await crypto.subtle.deriveBits({ name: 'ECDH', public: pub }, myKeys.privateKey, 256);
   var hk = await crypto.subtle.importKey('raw', shared, 'HKDF', false, ['deriveKey']);
-  derivedKey = await crypto.subtle.deriveKey(
-    { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: new TextEncoder().encode('arnon-v1-aesgcm') },
+  var a2b = await deriveDir(hk, 'arnon-v1-aesgcm-a2b');  // creator -> joiner
+  var b2a = await deriveDir(hk, 'arnon-v1-aesgcm-b2a');  // joiner -> creator
+  sendKey = isCreator ? a2b : b2a;
+  recvKey = isCreator ? b2a : a2b;
+}
+
+async function deriveDir(hk, info) {
+  return crypto.subtle.deriveKey(
+    { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: new TextEncoder().encode(info) },
     hk, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']
   );
 }
@@ -214,26 +227,34 @@ async function showSafetyNumber() {
 }
 
 // ── ENCRYPT/DECRYPT ──
+// Every payload carries a monotonic sequence number that is also bound into the GCM
+// tag as additional authenticated data (AAD). The receiver rejects any seq it has
+// already seen or that is lower than expected, and the AAD makes the declared seq
+// un-tamperable — together this stops a malicious relay from replaying frames.
+function seqAad(seq) { return new TextEncoder().encode('arnon-seq:' + seq); }
+
 async function enc(plaintext) {
   var iv = crypto.getRandomValues(new Uint8Array(12));
-  var ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, derivedKey, new TextEncoder().encode(plaintext));
-  return { iv: toB64(iv), ct: toB64(new Uint8Array(ct)) };
+  var seq = ++sendSeq;
+  var ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv, additionalData: seqAad(seq) }, sendKey, new TextEncoder().encode(plaintext));
+  return { iv: toB64(iv), ct: toB64(new Uint8Array(ct)), seq: seq };
 }
 
-async function dec(iv64, ct64) {
-  var pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: fromB64(iv64) }, derivedKey, fromB64(ct64));
+async function dec(iv64, ct64, seq) {
+  var pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: fromB64(iv64), additionalData: seqAad(seq) }, recvKey, fromB64(ct64));
   return new TextDecoder().decode(pt);
 }
 
 async function encBuf(data) {
   var iv = crypto.getRandomValues(new Uint8Array(12));
   var buf = data instanceof ArrayBuffer ? new Uint8Array(data) : data;
-  var ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, derivedKey, buf);
-  return { iv: toB64(iv), ct: toB64(new Uint8Array(ct)) };
+  var seq = ++sendSeq;
+  var ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv, additionalData: seqAad(seq) }, sendKey, buf);
+  return { iv: toB64(iv), ct: toB64(new Uint8Array(ct)), seq: seq };
 }
 
-async function decBuf(iv64, ct64) {
-  return await crypto.subtle.decrypt({ name: 'AES-GCM', iv: fromB64(iv64) }, derivedKey, fromB64(ct64));
+async function decBuf(iv64, ct64, seq) {
+  return await crypto.subtle.decrypt({ name: 'AES-GCM', iv: fromB64(iv64), additionalData: seqAad(seq) }, recvKey, fromB64(ct64));
 }
 
 // ── TIMER — absolute-deadline based, so a throttled/backgrounded tab stays accurate ──
@@ -332,7 +353,7 @@ async function handle(m) {
       await sendPub();
       break;
     case 'key':
-      if (derivedKey) break; // key exchange already completed; ignore duplicates
+      if (sendKey) break; // key exchange already completed; ignore duplicates
       peerPub = await importPub(m.pub);
       await derive(peerPub);
       connected = true;
@@ -343,11 +364,15 @@ async function handle(m) {
       if (ttlSeconds > 0) startTimer();
       break;
     case 'msg':
-      try { addMsg(linkify(escHtml(await dec(m.iv, m.ct))), 'r'); } catch(err) { addMsg('Decryption failed.', 'sys'); }
+      if (typeof m.seq !== 'number' || m.seq <= recvSeq) break;   // replayed or out-of-order: drop
+      try { var mt = await dec(m.iv, m.ct, m.seq); recvSeq = m.seq; addMsg(linkify(escHtml(mt)), 'r'); }
+      catch(err) { addMsg('Decryption failed.', 'sys'); }
       break;
     case 'voice':
+      if (typeof m.seq !== 'number' || m.seq <= recvSeq) break;   // replayed or out-of-order: drop
       try {
-        var buf = await decBuf(m.iv, m.ct);
+        var buf = await decBuf(m.iv, m.ct, m.seq);
+        recvSeq = m.seq;
         var vmime = m.mime || 'audio/webm';
         if (!/^audio\/(webm|ogg|mp4|mpeg|wav)(;.*)?$/.test(vmime)) vmime = 'audio/webm';
         var url = URL.createObjectURL(new Blob([buf], { type: vmime }));
@@ -417,12 +442,14 @@ function modalKeydown(e) {
 async function create() {
   var ttl = parseInt(document.getElementById('ttlSelect').value);
   hideCreate();
+  isCreator = true;            // creator = role "a" for directional key derivation
   await genKeys();
   connect(function() { wsend({ type: 'create', ttl: ttl }); });
 }
 
 async function joinRoom(roomId) {
   room = roomId;
+  isCreator = false;           // joiner = role "b" for directional key derivation
   await genKeys();
   connect(function() { wsend({ type: 'join', room: room }); });
   show('chat');
@@ -433,10 +460,10 @@ async function joinRoom(roomId) {
 async function send() {
   var inp = document.getElementById('msgIn'), text = inp.value.trim();
   if (!text) return;
-  if (!connected || !derivedKey) { toast('Waiting for peer to connect'); return; }
+  if (!connected || !sendKey) { toast('Waiting for peer to connect'); return; }
   inp.value = '';
   var e = await enc(text);
-  wsend({ type: 'msg', iv: e.iv, ct: e.ct });
+  wsend({ type: 'msg', iv: e.iv, ct: e.ct, seq: e.seq });
   addMsg(linkify(escHtml(text)), 's');
 }
 
@@ -448,7 +475,7 @@ function destroy() {
   // tell the peer this is an intentional close (their UI can distinguish it
   // from a dropped connection) — best-effort, before we tear the socket down
   if (ws && ws.readyState === 1) { try { ws.send(JSON.stringify({ type: 'bye' })); } catch(e) {} }
-  connected = false; derivedKey = null; myKeys = null; peerPub = null; ttlSeconds = 0; roomCreatedAt = 0; destructAt = 0; warned60 = false; disconnectNotice = null;
+  connected = false; sendKey = null; recvKey = null; sendSeq = 0; recvSeq = 0; isCreator = false; myKeys = null; peerPub = null; ttlSeconds = 0; roomCreatedAt = 0; destructAt = 0; warned60 = false; disconnectNotice = null;
   blobUrls.forEach(function(u) { try { URL.revokeObjectURL(u); } catch(e) {} }); blobUrls = [];
   if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
   if (ws) { ws.close(); ws = null; }
@@ -477,14 +504,14 @@ async function toggleRec() {
     recording = false;
     document.getElementById('micBtn').classList.remove('rec');
     clearTimeout(recTimeout);
-    if (!connected || !derivedKey) { toast('Not connected'); return; }
+    if (!connected || !sendKey) { toast('Not connected'); return; }
     if (chunks.length === 0) { toast('No audio recorded'); return; }
     var mime = recorder.mimeType || 'audio/webm';
     var blob = new Blob(chunks, { type: mime });
     var buf = await blob.arrayBuffer();
     try {
       var e = await encBuf(buf);
-      wsend({ type: 'voice', iv: e.iv, ct: e.ct, mime: mime });
+      wsend({ type: 'voice', iv: e.iv, ct: e.ct, seq: e.seq, mime: mime });
       var surl = URL.createObjectURL(blob); blobUrls.push(surl);
       addMsg('<audio controls aria-label="Voice note you sent" src="' + surl + '"></audio>', 's');
     } catch (err) { toast('Send failed'); }

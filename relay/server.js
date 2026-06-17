@@ -18,13 +18,28 @@ const MAX_CONNS_PER_IP = 10;        // open sockets per IP
 const MAX_TOTAL_ROOMS = 5000;       // global ceiling (botnet protection)
 const ROOM_ID_BYTES = 12;           // 96-bit room id
 const IDLE_MS = 30000;              // drop a socket that never joins/creates
+const LONE_ROOM_MS = 600000;       // 10 min: destroy a created-but-never-joined room even if its
+                                   // socket keeps answering heartbeats (bounds abandoned rooms).
+                                   // Generous enough to share a link and wait for the peer.
 const MSG_BURST = 20;               // token bucket size
 const MSG_REFILL = 10;              // tokens added per second
 const HEARTBEAT_MS = 30000;
 
-// Bind to loopback only: Caddy (same host) reverse-proxies to it; never exposed to the public interface.
-const wss = new WebSocketServer({ host: '127.0.0.1', port: PORT, maxPayload: MAX_MSG_SIZE });
-console.log('[arnon-relay] :' + PORT + (TRUST_PROXY ? ' (trust-proxy)' : ''));
+// Bind to loopback by default: Caddy (same host / same network namespace) reverse-proxies
+// to it; it is never meant to face the public interface directly. HOST can override this for
+// container setups where the proxy is a sidecar — but see the warning.
+//
+// ⚠ SECURITY: never combine a non-loopback HOST (e.g. 0.0.0.0) with TRUST_PROXY=1.
+// TRUST_PROXY=1 makes the relay trust the last X-Forwarded-For hop; if any client can reach
+// the relay directly, it can forge that header and bypass every per-IP limit. TRUST_PROXY=1
+// is only safe when the ONLY thing that can reach this socket is a trusted reverse proxy.
+const HOST = process.env.HOST || '127.0.0.1';
+if (HOST !== '127.0.0.1' && HOST !== '::1' && TRUST_PROXY) {
+  console.warn('[arnon-relay] WARNING: TRUST_PROXY=1 with non-loopback HOST=' + HOST +
+    ' — X-Forwarded-For is forgeable unless a trusted proxy is the only reachable client.');
+}
+const wss = new WebSocketServer({ host: HOST, port: PORT, maxPayload: MAX_MSG_SIZE });
+console.log('[arnon-relay] ' + HOST + ':' + PORT + (TRUST_PROXY ? ' (trust-proxy)' : ''));
 
 function clientIp(req) {
   if (TRUST_PROXY) {
@@ -71,6 +86,9 @@ wss.on('connection', function(ws, req) {
 
   ws.on('message', function(raw) {
     if (raw.length > MAX_MSG_SIZE) return;
+    // Token-bucket every inbound frame — including create/join and even unparseable
+    // garbage — so the pre-room handshake can't be used as a cheap flood vector.
+    if (!allowMessage()) { try { ws.close(1008, 'rate'); } catch(e) {} return; }
     var m;
     try { m = JSON.parse(raw); } catch (e) { return; }
 
@@ -83,6 +101,11 @@ wss.on('connection', function(ws, req) {
       var ttl = Math.min(Math.max(parseInt(m.ttl, 10) || 0, 0), 3600);
       var r = { peers: new Set([ws]), created: Date.now(), ttl: ttl, ip: ip };
       if (ttl > 0) r.timer = setTimeout(function() { destroyRoom(id); }, ttl * 1000);
+      // tear down the room if a second peer never shows up, regardless of heartbeat
+      r.loneTimer = setTimeout(function() {
+        var rr = rooms.get(id);
+        if (rr && rr.peers.size < 2) destroyRoom(id);
+      }, LONE_ROOM_MS);
       rooms.set(id, r);
       room = id;
       clearTimeout(idleTimer);
@@ -96,6 +119,7 @@ wss.on('connection', function(ws, req) {
       var r = rooms.get(m.room);
       if (r.peers.size >= 2) return ws.send(JSON.stringify({ type: 'error', msg: 'full' }));
       r.peers.add(ws);
+      if (r.loneTimer) { clearTimeout(r.loneTimer); r.loneTimer = null; }   // second peer arrived
       room = m.room;
       clearTimeout(idleTimer);
       var elapsed = Math.floor((Date.now() - r.created) / 1000);
@@ -106,7 +130,6 @@ wss.on('connection', function(ws, req) {
     }
 
     else if (m.type === 'key' || m.type === 'msg' || m.type === 'voice' || m.type === 'bye') {
-      if (!allowMessage()) { try { ws.close(1008, 'rate'); } catch(e) {} return; }
       if (!room || !rooms.has(room)) return;
       rooms.get(room).peers.forEach(function(p) { if (p !== ws && p.readyState === 1) p.send(raw); });
     }
@@ -127,6 +150,7 @@ function destroyRoom(id) {
   if (!rooms.has(id)) return;
   var r = rooms.get(id);
   if (r.timer) clearTimeout(r.timer);
+  if (r.loneTimer) clearTimeout(r.loneTimer);
   dec(ipRooms, r.ip);
   r.peers.forEach(function(p) {
     if (p.readyState === 1) {

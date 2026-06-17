@@ -85,14 +85,24 @@ systemctl reload caddy
 
 ### Docker
 
+The relay binds to `127.0.0.1` **inside** the container, so it is only reachable from
+within the container's own network namespace — by design. On Linux, use `--network host`
+so the host's Caddy can reach it on loopback (or run Caddy as a sidecar in the same
+namespace). A plain `-p` publish will **not** reach it.
+
 ```bash
 cd relay && npm install   # create package-lock.json first (npm ci needs it)
 cd ..
 docker build -t arnon-relay .
-docker run -d --name arnon-relay -p 127.0.0.1:9444:9444 \
+docker run -d --name arnon-relay --network host \
   -e TRUST_PROXY=1 --restart always arnon-relay
-# put Caddy in front for TLS
+# put Caddy (on the host) in front for TLS -> proxies wss to 127.0.0.1:9444
 ```
+
+> ⚠ **Never expose the relay directly while `TRUST_PROXY=1`.** That flag trusts the
+> last `X-Forwarded-For` hop; if any client can reach the relay without going through
+> your proxy (e.g. `HOST=0.0.0.0`, or publishing the port on a public interface), it
+> can forge that header and bypass every per-IP limit. Keep the default loopback bind.
 
 ### App + landing page
 
