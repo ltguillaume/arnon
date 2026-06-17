@@ -104,6 +104,39 @@ docker run -d --name arnon-relay --network host \
 > your proxy (e.g. `HOST=0.0.0.0`, or publishing the port on a public interface), it
 > can forge that header and bypass every per-IP limit. Keep the default loopback bind.
 
+### Firewall
+
+Whatever host runs the relay, lock the relay port (`9444`) so only the
+co-located proxy can reach it. The loopback bind already does this, but a
+host- or network-level firewall is a second layer that survives a
+misconfigured `HOST` or a switch to `-p` publishing.
+
+Open only what the world needs — `22` (SSH), `80`, and `443` (Caddy/TLS) —
+and leave `9444` closed. Caddy still reaches the relay over loopback
+(`127.0.0.1:9444`), which never crosses the network filter.
+
+**Cloud firewall (recommended where available, e.g. Hetzner/AWS/GCP):**
+runs outside the machine, so it is not bypassed by Docker's iptables rules.
+Add inbound rules allowing TCP `22`, `80`, `443` from anywhere; allow
+nothing else. Attach it to the relay host.
+
+**ufw (in-host, Debian/Ubuntu):**
+
+```bash
+sudo ufw allow OpenSSH
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+sudo ufw enable
+```
+
+`9444` needs no rule — ufw denies unlisted inbound by default, and loopback
+traffic from Caddy stays internal.
+
+> ⚠ With `docker run -p`, Docker writes its own iptables rules and bypasses
+> ufw, so a published port can be reachable even when ufw "denies" it. Either
+> keep the loopback bind (the default) with `--network host`, or use a cloud
+> firewall, which sits outside the host and is not affected.
+
 ### App + landing page
 
 Host on GitHub Pages. Update the `RELAY` and `BASE` constants at the top of
